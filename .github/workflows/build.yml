@@ -1,12 +1,12 @@
-# Builds the Figshop desktop installers on real runners (cross-building Windows
-# from macOS isn't reliable, so each OS builds its own).
+# Builds the Figshop desktop installers on real runners and publishes a Release.
 #
-#  • Run from the Actions tab (workflow_dispatch) → uploads installers as artifacts.
-#  • Push a tag like v0.1.0                        → also publishes a GitHub Release
-#                                                     with the installers attached.
+#  • workflow_dispatch → builds installers, uploads them as artifacts.
+#  • push tag vX.Y.Z    → builds, then publishes ONE GitHub Release with both
+#                         the macOS .dmg and Windows .exe attached.
 #
-# Signing/notarization happen automatically IF you add these repo secrets
-# (Settings ▸ Secrets and variables ▸ Actions). Without them, builds are unsigned.
+# Each OS builds its own installer (cross-building isn't reliable). Publishing is
+# done once in a separate job — no parallel-publish race, and a real (non-draft)
+# release. Builds are unsigned unless you add the signing secrets:
 #   macOS  : MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_ID,
 #            APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID
 #   Windows: WIN_CSC_LINK, WIN_CSC_KEY_PASSWORD
@@ -17,9 +17,6 @@ on:
   push:
     tags: ['v*']
 
-permissions:
-  contents: write # needed to create the Release on a tag
-
 jobs:
   build:
     strategy:
@@ -27,15 +24,14 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            suffix: mac
+            flag: mac
           - os: windows-latest
-            suffix: win
+            flag: win
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: desktop
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
       CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
       APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -49,19 +45,32 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      - name: Build (publish a Release on tags, artifacts otherwise)
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            npm run release:${{ matrix.suffix }}
-          else
-            npm run dist:${{ matrix.suffix }}
-          fi
+      - run: npm run dist:${{ matrix.flag }}
       - uses: actions/upload-artifact@v4
         with:
-          name: figshop-${{ matrix.os }}
+          name: installer-${{ matrix.flag }}
           path: |
             desktop/dist/*.dmg
-            desktop/dist/*.pkg
             desktop/dist/*.exe
-          if-no-files-found: ignore
+          if-no-files-found: error # fail loudly if the installer wasn't produced
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - run: ls -R artifacts
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Figshop ${GITHUB_REF_NAME}" \
+            --notes "Figshop helper installers. macOS users: right-click ▸ Open the first time (unsigned). Windows users: More info ▸ Run anyway." \
+            artifacts/installer-mac/*.dmg artifacts/installer-win/*.exe

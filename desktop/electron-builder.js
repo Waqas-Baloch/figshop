@@ -46,5 +46,6 @@ module.exports = {
     oneClick: true,
     perMachine: false,
     runAfterFinish: true, // launches the helper right after install
+    artifactName: 'Figshop-Setup-${version}.${ext}', // no spaces in the download URL
   },
 };

@@ -6,15 +6,11 @@
   "author": "Figshop",
   "main": "main.js",
   "scripts": {
-    "sync-core": "node -e \"require('fs').copyFileSync('../bridge/bridge.js','bridge.mjs')\"",
-    "icons": "node make-icons.mjs",
-    "start": "npm run sync-core && electron .",
-    "prep": "npm run sync-core && npm run icons",
-    "dist": "npm run prep && electron-builder --publish never",
-    "dist:mac": "npm run prep && electron-builder --mac --publish never",
-    "dist:win": "npm run prep && electron-builder --win --publish never",
-    "release:mac": "npm run prep && electron-builder --mac --publish always",
-    "release:win": "npm run prep && electron-builder --win --publish always"
+    "prep": "node prep.js",
+    "start": "node prep.js && electron .",
+    "dist": "node prep.js && electron-builder --publish never",
+    "dist:mac": "node prep.js && electron-builder --mac --publish never",
+    "dist:win": "node prep.js && electron-builder --win --publish never"
   },
   "dependencies": {
     "@napi-rs/canvas": "^0.1.65",
