@@ -57,7 +57,7 @@ async function sendNode(node, force) {
     throw new Error('this layer type has no image fill');
   }
   // Export at up to 2×, but keep both dimensions within Figma's 4096px image
-  // limit so the edited result can be re-imported on the way back.
+  // limit so the edited result can be applied back on the way in.
   const maxDim = Math.max(node.width || 1, node.height || 1);
   const scale = Math.min(EXPORT_SCALE, 4096 / maxDim);
   const bytes = await node.exportAsync({
@@ -96,7 +96,7 @@ async function applyUpdate(nodeId, base64Png) {
   try {
     image = figma.createImage(figma.base64Decode(base64Png));
   } catch (e) {
-    figma.notify('Image too large to import (max 4096×4096). Scale it down in Photoshop.');
+    figma.notify('Image too large for Figma (max 4096×4096). Scale it down in Photoshop.');
     return;
   }
 
