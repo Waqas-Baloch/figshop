@@ -1,0 +1,67 @@
+# Builds the Figshop desktop installers on real runners (cross-building Windows
+# from macOS isn't reliable, so each OS builds its own).
+#
+#  • Run from the Actions tab (workflow_dispatch) → uploads installers as artifacts.
+#  • Push a tag like v0.1.0                        → also publishes a GitHub Release
+#                                                     with the installers attached.
+#
+# Signing/notarization happen automatically IF you add these repo secrets
+# (Settings ▸ Secrets and variables ▸ Actions). Without them, builds are unsigned.
+#   macOS  : MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_ID,
+#            APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID
+#   Windows: WIN_CSC_LINK, WIN_CSC_KEY_PASSWORD
+name: build-desktop
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # needed to create the Release on a tag
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            suffix: mac
+          - os: windows-latest
+            suffix: win
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+      WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - name: Build (publish a Release on tags, artifacts otherwise)
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            npm run release:${{ matrix.suffix }}
+          else
+            npm run dist:${{ matrix.suffix }}
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: figshop-${{ matrix.os }}
+          path: |
+            desktop/dist/*.dmg
+            desktop/dist/*.pkg
+            desktop/dist/*.exe
+          if-no-files-found: ignore

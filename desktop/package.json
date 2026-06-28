@@ -1,0 +1,29 @@
+{
+  "name": "figshop-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Figshop menu-bar app — runs the Figma↔Photoshop bridge with no Node required.",
+  "author": "Figshop",
+  "main": "main.js",
+  "scripts": {
+    "sync-core": "node -e \"require('fs').copyFileSync('../bridge/bridge.js','bridge.mjs')\"",
+    "icons": "node make-icons.mjs",
+    "start": "npm run sync-core && electron .",
+    "prep": "npm run sync-core && npm run icons",
+    "dist": "npm run prep && electron-builder --publish never",
+    "dist:mac": "npm run prep && electron-builder --mac --publish never",
+    "dist:win": "npm run prep && electron-builder --win --publish never",
+    "release:mac": "npm run prep && electron-builder --mac --publish always",
+    "release:win": "npm run prep && electron-builder --win --publish always"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.65",
+    "ag-psd": "^21.0.0",
+    "chokidar": "^3.6.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}

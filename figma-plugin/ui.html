@@ -1,0 +1,117 @@
+<!doctype html>
+<meta charset="utf-8" />
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 12px/1.4 -apple-system, 'Inter', sans-serif; margin: 0; padding: 12px; color: #1a1a1a; background: #fff; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e6e6e6; background: #1e1e1e; }
+    .log, .setup { background: #111; border-color: #333; }
+    button.ghost { color: #ccc; border-color: #444; }
+  }
+  .status { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #d33; box-shadow: 0 0 0 3px rgba(221,51,51,.15); }
+  .dot.on { background: #2bb673; box-shadow: 0 0 0 3px rgba(43,182,115,.18); }
+  .dot.wait { background: #e3a008; box-shadow: 0 0 0 3px rgba(227,160,8,.18); }
+  button { width: 100%; padding: 9px 12px; margin-bottom: 8px; border: 0; border-radius: 7px; font: inherit; font-weight: 600; cursor: pointer; background: #0d99ff; color: #fff; }
+  button.ghost { background: transparent; color: #555; border: 1px solid #ddd; font-weight: 500; }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .45; cursor: default; }
+  .hint { color: #888; font-size: 11px; margin: 2px 0 12px; }
+  .setup { border: 1px solid #ffe0a3; background: #fff8ec; border-radius: 8px; padding: 11px; margin-bottom: 12px; }
+  .setup h3 { margin: 0 0 4px; font-size: 12px; }
+  .setup p { margin: 0 0 9px; color: #8a6d3b; font-size: 11px; }
+  @media (prefers-color-scheme: dark) { .setup { border-color: #5a4a1f; background: #2a230f; } .setup p { color: #d9b96b; } }
+  .log { height: 110px; overflow: auto; padding: 8px; border: 1px solid #eee; border-radius: 7px; background: #fafafa; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  .hidden { display: none; }
+</style>
+
+<div class="status"><span class="dot wait" id="dot"></span><span id="statusText">Looking for the Figshop helper…</span></div>
+
+<!-- Shown only when the helper isn't running -->
+<div class="setup hidden" id="setup">
+  <h3>One-time setup</h3>
+  <p id="setupText">Install the Figshop helper — it opens your images in Photoshop and
+    syncs edits back. After installing, this panel connects automatically.</p>
+  <button id="download">Install Figshop helper</button>
+  <button id="retry" class="ghost">I've installed it — retry</button>
+</div>
+
+<button id="edit">Edit selected image in Photoshop</button>
+<button id="reset" class="ghost">Re-import from Figma (reset)</button>
+<p class="hint">Select an image, then click Edit. Save in Photoshop (⌘S / Ctrl+S) to update Figma.</p>
+
+<div class="log" id="log"></div>
+
+<script>
+  const BRIDGE = 'ws://localhost:3900';
+  // Published installers (the CI release-on-tag publishes the .dmg / .exe here).
+  const RELEASES_URL = 'https://github.com/Waqas-Baloch/figshop/releases/latest';
+  const WAKE_URL = 'figshop://wake'; // launches the helper if installed but not running
+
+  const isWin = /Win/i.test(navigator.userAgent);
+  const dot = document.getElementById('dot');
+  const statusText = document.getElementById('statusText');
+  const setup = document.getElementById('setup');
+  const logEl = document.getElementById('log');
+  document.getElementById('setupText'); // (kept generic for both OSes)
+  document.getElementById('download').textContent = 'Install Figshop helper for ' + (isWin ? 'Windows' : 'macOS');
+
+  const toPlugin = (m) => parent.postMessage({ pluginMessage: m }, '*');
+  function log(line) { const t = new Date().toLocaleTimeString(); logEl.textContent += `[${t}] ${line}\n`; logEl.scrollTop = logEl.scrollHeight; }
+
+  let connected = false;
+  let everConnected = false;
+  function setState(state) {
+    dot.className = 'dot' + (state === 'on' ? ' on' : state === 'wait' ? ' wait' : '');
+    statusText.textContent =
+      state === 'on' ? 'Helper connected' :
+      state === 'wait' ? 'Looking for the Figshop helper…' :
+      'Helper not running';
+    setup.classList.toggle('hidden', state === 'on');
+  }
+
+  // --- WebSocket to the local helper, with auto-reconnect + first-run grace ---
+  let ws, queue = [];
+  function connect() {
+    ws = new WebSocket(BRIDGE);
+    ws.onopen = () => {
+      connected = true; everConnected = true;
+      setState('on'); log('Connected to helper.');
+      queue.forEach((m) => ws.send(m)); queue = [];
+    };
+    ws.onclose = () => { connected = false; setState(everConnected ? 'off' : 'wait'); setTimeout(connect, 1500); };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.t === 'updated') toPlugin({ type: 'apply', nodeId: msg.nodeId, png: msg.png });
+      else if (msg.t === 'opened') log(`Opened in Photoshop: ${msg.file}`);
+      else if (msg.t === 'log') log(msg.message);
+      else if (msg.t === 'error') log('⚠ ' + msg.message);
+      else if (msg.t === 'ready') log('Helper ready.');
+    };
+  }
+  // If we haven't connected shortly after opening, the helper isn't installed/running.
+  setTimeout(() => { if (!connected) setState('off'); }, 2500);
+  function send(obj) {
+    const s = JSON.stringify(obj);
+    if (connected && ws.readyState === 1) ws.send(s);
+    else { queue.push(s); setState('off'); attemptWake(); } // reveal setup, try to launch helper
+  }
+  function attemptWake() { toPlugin({ type: 'open-url', url: WAKE_URL }); } // best-effort; no-op if not installed
+  connect();
+
+  // --- messages from the plugin main thread --------------------------------
+  onmessage = (event) => {
+    const msg = event.data.pluginMessage; if (!msg) return;
+    if (msg.type === 'open') send({ t: 'open', nodeId: msg.nodeId, name: msg.name, png: msg.png, force: msg.force });
+    else if (msg.type === 'log') log(msg.message);
+  };
+
+  // --- buttons -------------------------------------------------------------
+  document.getElementById('edit').onclick = () => { if (!connected) attemptWake(); toPlugin({ type: 'edit' }); };
+  document.getElementById('reset').onclick = () => toPlugin({ type: 'reset' });
+  document.getElementById('download').onclick = () => { toPlugin({ type: 'open-url', url: RELEASES_URL }); log('Opening the installer download…'); };
+  document.getElementById('retry').onclick = () => { log('Retrying…'); attemptWake(); try { ws.close(); } catch {} };
+
+  toPlugin({ type: 'ui-ready' });
+</script>

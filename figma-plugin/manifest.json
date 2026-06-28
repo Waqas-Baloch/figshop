@@ -1,0 +1,21 @@
+{
+  "name": "Figshop — Edit in Photoshop",
+  "id": "figshop.edit-in-photoshop",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "menu": [
+    { "name": "Open Figshop", "command": "connect" },
+    { "name": "Edit selection in Photoshop", "command": "edit" },
+    { "name": "Reset edit (re-import from Figma)", "command": "reset" }
+  ],
+  "relaunchButtons": [
+    { "command": "edit", "name": "Edit in Photoshop" }
+  ],
+  "networkAccess": {
+    "allowedDomains": ["http://localhost:3900", "ws://localhost:3900"],
+    "reasoning": "Sends selected images to the local Figshop bridge and receives Photoshop edits back."
+  }
+}
