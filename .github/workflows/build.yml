@@ -45,10 +45,11 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      # Separate steps (no `&&` chaining inside an npm script — that silently
-      # no-ops on Windows because npm runs scripts through cmd.exe).
+      # Invoke electron-builder's CLI directly via node. The npm/npx/.cmd shims
+      # silently no-op on Windows runners (no output, exit 0, no build); calling
+      # node on cli.js bypasses all of them and runs identically on both OSes.
       - run: npm run prep
-      - run: npx electron-builder --${{ matrix.flag }} --publish never
+      - run: node node_modules/electron-builder/cli.js --${{ matrix.flag }} --publish never
       - run: node -e "console.log('dist contents:', require('fs').readdirSync('dist'))"
       - uses: actions/upload-artifact@v4
         with:
