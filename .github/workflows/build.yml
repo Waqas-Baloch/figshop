@@ -45,7 +45,11 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      - run: npm run dist:${{ matrix.flag }}
+      # Separate steps (no `&&` chaining inside an npm script — that silently
+      # no-ops on Windows because npm runs scripts through cmd.exe).
+      - run: npm run prep
+      - run: npx electron-builder --${{ matrix.flag }} --publish never
+      - run: node -e "console.log('dist contents:', require('fs').readdirSync('dist'))"
       - uses: actions/upload-artifact@v4
         with:
           name: installer-${{ matrix.flag }}
