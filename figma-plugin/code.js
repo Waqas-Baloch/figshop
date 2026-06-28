@@ -4,7 +4,7 @@
 // All networking lives in ui.html, which talks to the local bridge.
 // We just shuttle messages between the document and the UI iframe.
 
-figma.showUI(__html__, { width: 340, height: 380, title: 'Figshop' });
+figma.showUI(__html__, { width: 340, height: 380, title: 'Figma To Photoshop' });
 
 const EXPORT_SCALE = 2; // export images at 2x so Photoshop edits stay crisp
 

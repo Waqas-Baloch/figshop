@@ -25,12 +25,12 @@
   .hidden { display: none; }
 </style>
 
-<div class="status"><span class="dot wait" id="dot"></span><span id="statusText">Looking for the Figshop helper…</span></div>
+<div class="status"><span class="dot wait" id="dot"></span><span id="statusText">Looking for the companion app…</span></div>
 
 <!-- Shown only when the helper isn't running -->
 <div class="setup hidden" id="setup">
   <h3>One-time setup</h3>
-  <p id="setupText">Install the Figshop helper — it opens your images in Photoshop and
+  <p id="setupText">Install the free companion app — it opens your images in Photoshop and
     syncs edits back. After installing, this panel connects automatically.</p>
   <button id="download">Install Figshop helper</button>
   <button id="retry" class="ghost">I've installed it — retry</button>
@@ -54,7 +54,7 @@
   const setup = document.getElementById('setup');
   const logEl = document.getElementById('log');
   document.getElementById('setupText'); // (kept generic for both OSes)
-  document.getElementById('download').textContent = 'Install Figshop helper for ' + (isWin ? 'Windows' : 'macOS');
+  document.getElementById('download').textContent = 'Install companion app for ' + (isWin ? 'Windows' : 'macOS');
 
   const toPlugin = (m) => parent.postMessage({ pluginMessage: m }, '*');
   function log(line) { const t = new Date().toLocaleTimeString(); logEl.textContent += `[${t}] ${line}\n`; logEl.scrollTop = logEl.scrollHeight; }
@@ -64,9 +64,9 @@
   function setState(state) {
     dot.className = 'dot' + (state === 'on' ? ' on' : state === 'wait' ? ' wait' : '');
     statusText.textContent =
-      state === 'on' ? 'Helper connected' :
-      state === 'wait' ? 'Looking for the Figshop helper…' :
-      'Helper not running';
+      state === 'on' ? 'Connected ✓' :
+      state === 'wait' ? 'Looking for the companion app…' :
+      'Companion app not running';
     setup.classList.toggle('hidden', state === 'on');
   }
 
