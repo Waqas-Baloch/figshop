@@ -78,17 +78,34 @@ function compositeUsable(canvas, hasLayers) {
   return true;
 }
 
-// Read the flattened image out of a saved .psd as a PNG buffer. Prefers
-// Photoshop's own composite (captures effects/blend modes), but flattens the
-// layers itself when that composite is missing or unusable — so the user never
-// has to enable "Maximize PSD Compatibility".
-export function compositePng(buf) {
+// Flatten a .psd to a canvas. Prefers Photoshop's own composite (captures
+// effects/blend modes), but flattens the layers itself when that composite is
+// missing or unusable — so the user never has to enable "Maximize PSD
+// Compatibility".
+function renderCompositeCanvas(buf) {
   const psd = readPsd(buf, { skipThumbnail: true });
   const hasLayers = !!(psd.children && psd.children.length);
-  if (psd.canvas && compositeUsable(psd.canvas, hasLayers)) {
-    return psd.canvas.toBuffer('image/png');
+  if (psd.canvas && compositeUsable(psd.canvas, hasLayers)) return psd.canvas;
+  return renderLayers(psd);
+}
+
+export function compositePng(buf) {
+  return renderCompositeCanvas(buf).toBuffer('image/png');
+}
+
+// Flattened preview for Figma: same composite, but scaled down so neither
+// dimension exceeds Figma's 4096px image limit. Returns the PNG + its size.
+export function compositePreview(buf, maxDim = 4096) {
+  const src = renderCompositeCanvas(buf);
+  const scale = Math.min(1, maxDim / Math.max(src.width, src.height));
+  if (scale === 1) {
+    return { png: src.toBuffer('image/png'), width: src.width, height: src.height };
   }
-  return renderLayers(psd).toBuffer('image/png');
+  const width = Math.round(src.width * scale);
+  const height = Math.round(src.height * scale);
+  const c = createCanvas(width, height);
+  c.getContext('2d').drawImage(src, 0, 0, width, height);
+  return { png: c.toBuffer('image/png'), width, height };
 }
 
 // Wrap an incoming PNG in a fresh .psd with a single editable layer.
@@ -153,6 +170,7 @@ export function createBridge(options = {}) {
   const emitter = new EventEmitter();
   const watchers = new Map(); // nodeId -> chokidar watcher
   const clients = new Set(); // connected Figma plugin UIs
+  const staging = new Map(); // importId -> raw PSD bytes, awaiting a Figma node id
   let server = null;
   let wss = null;
 
@@ -179,7 +197,7 @@ export function createBridge(options = {}) {
     });
     w.on('change', () => {
       try {
-        const png = compositePng(fs.readFileSync(psdPath));
+        const { png } = compositePreview(fs.readFileSync(psdPath));
         broadcast({ t: 'updated', nodeId, png: png.toString('base64') });
         log(`Saved → pushed back to Figma: ${path.basename(psdPath)}`);
       } catch (e) {
@@ -212,6 +230,31 @@ export function createBridge(options = {}) {
     broadcast({ t: 'opened', nodeId, file: entry.file });
   }
 
+  // Step 1 of "Place PSD": render a flat preview, keep the layered PSD staged
+  // until the plugin creates a Figma node and tells us its id.
+  function handleImport({ psd, name }) {
+    const buf = Buffer.from(psd, 'base64');
+    const { png, width, height } = compositePreview(buf);
+    const importId = `imp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    staging.set(importId, buf);
+    broadcast({ t: 'imported', importId, name, width, height, png: png.toString('base64') });
+    log(`Imported layered PSD "${name}" (${width}×${height}px) — placing in Figma`);
+  }
+
+  // Step 2: bind the staged PSD to the node the plugin just created, so future
+  // "Edit in Photoshop" on that image opens these original layers.
+  function handleBind({ importId, nodeId, name }) {
+    const buf = staging.get(importId);
+    if (!buf) { log(`Bind failed: import ${importId} expired`); return; }
+    staging.delete(importId);
+    const file = `${sanitize(name || 'image')}_${sanitize(nodeId)}.psd`;
+    fs.writeFileSync(path.join(psdDir, file), buf);
+    const ix = loadIndex();
+    ix[nodeId] = { file, name };
+    saveIndex(ix);
+    log(`Linked layers to the placed image — Edit in Photoshop now opens the original PSD`);
+  }
+
   function start() {
     if (server) return;
     server = http.createServer((req, res) => {
@@ -233,6 +276,8 @@ export function createBridge(options = {}) {
         try { msg = JSON.parse(data.toString()); } catch { return; }
         try {
           if (msg.t === 'open') await handleOpen(msg);
+          else if (msg.t === 'import') handleImport(msg);
+          else if (msg.t === 'bind') handleBind(msg);
         } catch (e) {
           log(`Error: ${e.message}`);
           ws.send(JSON.stringify({ t: 'error', nodeId: msg?.nodeId, message: e.message }));

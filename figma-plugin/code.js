@@ -27,6 +27,9 @@ figma.ui.onmessage = async (msg) => {
     case 'apply':
       await applyUpdate(msg.nodeId, msg.png);
       break;
+    case 'place':
+      await placePsd(msg);
+      break;
     case 'open-url':
       // Used by the UI to open the installer download or wake the helper
       // (figshop://). openExternal may reject non-http schemes — that's fine.
@@ -110,6 +113,36 @@ async function applyUpdate(nodeId, base64Png) {
   }
   node.fills = next;
   figma.notify(`Updated "${node.name}" from Photoshop ✓`);
+}
+
+// --- place a layered PSD as a new image, linked to its layers --------------
+
+async function placePsd(msg) {
+  let image;
+  try {
+    image = figma.createImage(figma.base64Decode(msg.png));
+  } catch (e) {
+    figma.notify('Could not place PSD: ' + e.message);
+    return;
+  }
+  const rect = figma.createRectangle();
+  rect.resize(Math.max(1, msg.width), Math.max(1, msg.height));
+  rect.name = (msg.name || 'PSD').replace(/\.(psd|psb)$/i, '');
+  rect.fills = [{ type: 'IMAGE', scaleMode: 'FILL', imageHash: image.hash }];
+
+  // Drop it at the center of the current viewport.
+  const center = figma.viewport.center;
+  rect.x = Math.round(center.x - msg.width / 2);
+  rect.y = Math.round(center.y - msg.height / 2);
+  figma.currentPage.appendChild(rect);
+
+  rect.setRelaunchData({ edit: 'Open this image in Photoshop' });
+  figma.currentPage.selection = [rect];
+  figma.viewport.scrollAndZoomIntoView([rect]);
+
+  // Tell the bridge which node now owns this PSD's layers.
+  figma.ui.postMessage({ type: 'bind', importId: msg.importId, nodeId: rect.id, name: rect.name });
+  figma.notify(`Placed "${rect.name}" — Edit in Photoshop opens its layers.`);
 }
 
 const clone = (v) => JSON.parse(JSON.stringify(v));

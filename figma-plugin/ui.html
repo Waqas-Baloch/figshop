@@ -37,8 +37,10 @@
 </div>
 
 <button id="edit">Edit selected image in Photoshop</button>
+<button id="place" class="ghost">Place a layered PSD…</button>
 <button id="reset" class="ghost">Re-import from Figma (reset)</button>
-<p class="hint">Select an image, then click Edit. Save in Photoshop (⌘S / Ctrl+S) to update Figma.</p>
+<input type="file" id="psdFile" accept=".psd,.psb" style="display:none" />
+<p class="hint">Edit a selected image, or Place a PSD to drop it in with its layers kept. Save in Photoshop (⌘S / Ctrl+S) to update Figma.</p>
 
 <div class="log" id="log"></div>
 
@@ -84,6 +86,7 @@
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
       if (msg.t === 'updated') toPlugin({ type: 'apply', nodeId: msg.nodeId, png: msg.png });
+      else if (msg.t === 'imported') toPlugin({ type: 'place', importId: msg.importId, name: msg.name, width: msg.width, height: msg.height, png: msg.png });
       else if (msg.t === 'opened') log(`Opened in Photoshop: ${msg.file}`);
       else if (msg.t === 'log') log(msg.message);
       else if (msg.t === 'error') log('⚠ ' + msg.message);
@@ -104,12 +107,29 @@
   onmessage = (event) => {
     const msg = event.data.pluginMessage; if (!msg) return;
     if (msg.type === 'open') send({ t: 'open', nodeId: msg.nodeId, name: msg.name, png: msg.png, force: msg.force });
+    else if (msg.type === 'bind') send({ t: 'bind', importId: msg.importId, nodeId: msg.nodeId, name: msg.name });
     else if (msg.type === 'log') log(msg.message);
   };
 
   // --- buttons -------------------------------------------------------------
   document.getElementById('edit').onclick = () => { if (!connected) attemptWake(); toPlugin({ type: 'edit' }); };
   document.getElementById('reset').onclick = () => toPlugin({ type: 'reset' });
+  document.getElementById('place').onclick = () => {
+    if (!connected) { attemptWake(); setState('off'); log('Install the companion app first, then Place a PSD.'); return; }
+    document.getElementById('psdFile').click();
+  };
+  document.getElementById('psdFile').onchange = (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const d = reader.result; // data:...;base64,XXXX
+      send({ t: 'import', psd: d.slice(d.indexOf(',') + 1), name: f.name });
+      log('Uploading PSD: ' + f.name + '…');
+    };
+    reader.readAsDataURL(f);
+    e.target.value = ''; // allow re-selecting the same file
+  };
   document.getElementById('download').onclick = () => { toPlugin({ type: 'open-url', url: RELEASES_URL }); log('Opening the installer download…'); };
   document.getElementById('retry').onclick = () => { log('Retrying…'); attemptWake(); try { ws.close(); } catch {} };
 
