@@ -21,6 +21,19 @@ module.exports = {
   directories: { output: 'dist' },
   publish: [{ provider: 'github', owner: 'Waqas-Baloch', repo: 'figshop' }],
 
+  // When there's no real Developer ID, electron-builder leaves the app with a
+  // broken default signature → macOS reports "damaged". Ad-hoc sign the packed
+  // .app ourselves so it's the normal "unverified developer" prompt instead.
+  // (Skipped when CSC_LINK is set — real signing handles it.)
+  afterPack: async (context) => {
+    if (context.electronPlatformName !== 'darwin' || process.env.CSC_LINK) return;
+    const path = require('node:path');
+    const { execFileSync } = require('node:child_process');
+    const appPath = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`);
+    execFileSync('codesign', ['--force', '--deep', '--sign', '-', appPath], { stdio: 'inherit' });
+    console.log('  • ad-hoc signed', appPath);
+  },
+
   mac: {
     category: 'public.app-category.graphics-design',
     // A signed .pkg gives a clean double-click install (no drag); unsigned it's
@@ -28,13 +41,20 @@ module.exports = {
     target: signMac ? ['dmg', 'pkg'] : ['dmg'],
     icon: 'assets/icon.png',
     extendInfo: { LSUIElement: true },
-    hardenedRuntime: true,
-    gatekeeperAssess: false,
-    entitlements: 'build/entitlements.mac.plist',
-    entitlementsInherit: 'build/entitlements.mac.plist',
-    // No Developer ID available → explicitly skip signing so the build succeeds.
-    ...(signMac ? {} : { identity: null }),
-    ...(notarize ? { notarize: true } : {}),
+    ...(signMac
+      ? {
+          // Real Developer ID → harden + notarize for a warning-free install.
+          hardenedRuntime: true,
+          gatekeeperAssess: false,
+          entitlements: 'build/entitlements.mac.plist',
+          entitlementsInherit: 'build/entitlements.mac.plist',
+          ...(notarize ? { notarize: true } : {}),
+        }
+      : {
+          // No Developer ID → let electron-builder skip its own signing; the
+          // afterPack hook above ad-hoc signs the app so it isn't "damaged".
+          identity: null,
+        }),
   },
 
   win: {
