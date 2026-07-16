@@ -20,7 +20,7 @@ figma.ui.onmessage = async (msg) => {
       const saved = await figma.clientStorage.getAsync('pairingToken');
       figma.ui.postMessage({ type: 'config', token: saved || '' });
       if (command === 'edit') await editSelection(false);
-      else if (command === 'reset') await editSelection(true);
+      else if (command === 'reset') await resetSelection();
       break;
     }
     case 'save-token': {
@@ -34,7 +34,7 @@ figma.ui.onmessage = async (msg) => {
       await editSelection(false);
       break;
     case 'reset':
-      await editSelection(true);
+      await resetSelection();
       break;
     case 'apply':
       await applyUpdate(msg.nodeId, msg.png);
@@ -67,10 +67,24 @@ async function editSelection(force) {
   }
 }
 
+// A group/frame of vectors can't show an image fill (its children paint over it),
+// so those get an image "proxy" instead — see applyUpdate.
+const isContainer = (node) => 'children' in node && node.children.length > 0;
+const proxyOf = async (node) => {
+  const id = node.getPluginData('proxyId');
+  if (!id) return null;
+  const p = await figma.getNodeByIdAsync(id);
+  return p && !p.removed ? p : null;
+};
+
 async function sendNode(node, force) {
-  if (!('fills' in node)) {
-    throw new Error('this layer type has no image fill');
+  if (!('exportAsync' in node)) {
+    throw new Error('this layer type cannot be exported');
   }
+  // Editing a proxy image reopens the ORIGINAL artwork's PSD, so the bridge is
+  // always keyed by the source node.
+  const key = node.getPluginData('sourceId') || node.id;
+
   // Export at up to 2×, but keep both dimensions within Figma's 4096px image
   // limit so the edited result can be applied back on the way in.
   const maxDim = Math.max(node.width || 1, node.height || 1);
@@ -85,7 +99,7 @@ async function sendNode(node, force) {
 
   figma.ui.postMessage({
     type: 'open',
-    nodeId: node.id,
+    nodeId: key,
     name: node.name,
     png: figma.base64Encode(bytes),
     force: !!force,
@@ -97,16 +111,11 @@ async function sendNode(node, force) {
 
 async function applyUpdate(nodeId, base64Png) {
   const node = await figma.getNodeByIdAsync(nodeId);
-  if (!node || !('fills' in node)) {
+  if (!node || node.removed) {
     figma.notify('Original layer not found — it may have been deleted.');
     return;
   }
 
-  const fills = node.fills;
-  if (fills === figma.mixed) {
-    figma.notify('Layer has mixed fills — open it individually.');
-    return;
-  }
   let image;
   try {
     image = figma.createImage(figma.base64Decode(base64Png));
@@ -130,12 +139,83 @@ async function applyUpdate(nodeId, base64Png) {
     return p;
   };
 
-  const next = clone(fills);
-  const i = next.findIndex((p) => p.type === 'IMAGE');
-  if (i >= 0) next[i] = cleanPaint(next[i]); // replace in place (keeps z-order)
-  else next.push(cleanPaint(null));          // e.g. a vector: paints inside its shape
-  node.fills = next;
-  figma.notify(`Updated "${node.name}" from Photoshop ✓`);
+  // 1) Already has a proxy image from a previous edit → just refresh it.
+  const existing = await proxyOf(node);
+  if (existing) {
+    existing.fills = [cleanPaint(null)];
+    figma.notify(`Updated "${node.name}" from Photoshop ✓`);
+    return;
+  }
+
+  // 2) Vector artwork (group/frame): its children would paint over any fill, so
+  //    keep the original artwork intact but hidden and show the edit in its slot.
+  if (isContainer(node)) {
+    const rect = figma.createRectangle();
+    rect.resize(Math.max(1, node.width), Math.max(1, node.height));
+    rect.x = node.x;
+    rect.y = node.y;
+    rect.name = `${node.name} (Photoshop)`;
+    rect.fills = [cleanPaint(null)];
+
+    const parent = node.parent;
+    parent.insertChild(parent.children.indexOf(node), rect); // same z-slot
+    node.visible = false;                                    // vectors preserved, just hidden
+
+    node.setPluginData('proxyId', rect.id);
+    rect.setPluginData('sourceId', node.id);
+    rect.setRelaunchData({ edit: 'Open this image in Photoshop' });
+    figma.currentPage.selection = [rect];
+    figma.notify(`Updated "${node.name}" ✓ — original vectors kept (hidden). Reset restores them.`);
+    return;
+  }
+
+  // 3) A leaf (image, vector, shape): paint it in place — a vector keeps its
+  //    path/strokes and clips the image to its own shape.
+  if ('fills' in node) {
+    const fills = node.fills;
+    if (fills === figma.mixed) {
+      figma.notify('Layer has mixed fills — open it individually.');
+      return;
+    }
+    const next = clone(fills);
+    const i = next.findIndex((p) => p.type === 'IMAGE');
+    if (i >= 0) next[i] = cleanPaint(next[i]); // replace in place (keeps z-order)
+    else next.push(cleanPaint(null));          // vector: paints inside its shape
+    node.fills = next;
+    figma.notify(`Updated "${node.name}" from Photoshop ✓`);
+    return;
+  }
+
+  figma.notify(`Can't apply the edit to "${node.name}" (unsupported layer type).`);
+}
+
+// Reset: on a proxy image, bring the original vector artwork back.
+async function resetSelection() {
+  const selection = figma.currentPage.selection;
+  if (selection.length === 0) {
+    figma.notify('Select a layer first.');
+    return;
+  }
+  for (const node of selection) {
+    const sourceId = node.getPluginData('sourceId');
+    if (sourceId) {
+      const source = await figma.getNodeByIdAsync(sourceId);
+      if (source && !source.removed) {
+        source.visible = true;
+        source.setPluginData('proxyId', '');
+        figma.currentPage.selection = [source];
+        node.remove();
+        figma.notify(`Restored the original artwork for "${source.name}".`);
+        continue;
+      }
+    }
+    // Not a proxy → force a fresh re-import from Figma.
+    try {
+      await sendNode(node, true);
+    } catch (e) {
+      figma.notify(`Couldn't reset "${node.name}": ${e.message}`);
+    }
+  }
 }
 
 // --- place a layered PSD as a new image, linked to its layers --------------
