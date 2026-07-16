@@ -3,6 +3,7 @@
 import { createBridge } from './bridge.js';
 import { WebSocket } from 'ws';
 import net from 'node:net';
+import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -157,6 +158,33 @@ console.log('\n6) Feature still works once paired (Place PSD round-trip)');
     ok('original layered PSD preserved byte-for-byte', onDisk.equals(psdBuf));
   }
   c.ws.close();
+}
+
+console.log('\n7) Frame size cap still enforced after the noServer refactor');
+{
+  const c = await authed();
+  let closeCode = null;
+  c.ws.on('close', (code) => { closeCode = code; });
+  c.ws.send(JSON.stringify({ t: 'import', psd: 'A'.repeat(70 * 1024 * 1024), name: 'huge.psd' }));
+  await new Promise((r) => setTimeout(r, 2500));
+  ok('oversized frame (>64MB) rejected', closeCode === 1009, `close=${closeCode}`);
+}
+
+console.log('\n8) HTTP surface');
+{
+  const req = (hostHeader) => new Promise((res) => {
+    const r = http.request({ host: '127.0.0.1', port: PORT, path: '/health', headers: { Host: hostHeader } }, (resp) => {
+      let d = ''; resp.on('data', (c) => (d += c)); resp.on('end', () => res({ status: resp.statusCode, body: d }));
+    });
+    r.on('error', () => res({ status: 0, body: '' }));
+    r.end();
+  });
+  const good = await req(`127.0.0.1:${PORT}`);
+  const evil = await req('evil.example.com');
+  ok('health responds on loopback Host', good.status === 200, `status=${good.status}`);
+  ok('health rejects non-loopback Host (rebinding)', evil.status === 403, `status=${evil.status}`);
+  ok('health leaks no pairing token', !good.body.includes(bridge.token), good.body);
+  ok('health exposes no filesystem paths', !/\/Users\/|home\/|psd/i.test(good.body), good.body);
 }
 
 bridge.stop();

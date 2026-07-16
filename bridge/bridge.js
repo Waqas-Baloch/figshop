@@ -201,7 +201,11 @@ function openInPhotoshop(psdPath, appOverride) {
   if (process.platform === 'win32') {
     const exe = appOverride || findWindowsPhotoshop();
     if (exe) return spawn(exe, [psdPath]);
-    return spawn('cmd', ['/c', 'start', '', psdPath]); // default .psd handler
+    // Open with the default .psd handler WITHOUT a shell: `cmd /c start` would
+    // re-parse the command line, so any metacharacter in the path (e.g. an "&"
+    // in the user's home folder) could break out. rundll32 takes the path as a
+    // plain argument.
+    return spawn('rundll32', ['url.dll,FileProtocolHandler', psdPath]);
   }
   return spawn('xdg-open', [psdPath]); // best effort elsewhere
 }
