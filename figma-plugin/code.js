@@ -115,14 +115,25 @@ async function applyUpdate(nodeId, base64Png) {
     return;
   }
 
-  // Replace the existing image paint in place (keeps scaleMode, opacity, etc.).
+  // The PNG is the node's fully-rendered appearance at the node's own aspect
+  // ratio, so it must map 1:1 onto the node. Carrying over the previous paint's
+  // geometry (a CROP imageTransform, TILE scalingFactor, FIT, or rotation) would
+  // re-transform an already-transformed image — that's what stretched it. Keep
+  // only the cosmetic properties.
+  const cleanPaint = (old) => {
+    const p = { type: 'IMAGE', scaleMode: 'FILL', imageHash: image.hash };
+    if (old) {
+      if (old.opacity !== undefined) p.opacity = old.opacity;
+      if (old.visible !== undefined) p.visible = old.visible;
+      if (old.blendMode !== undefined) p.blendMode = old.blendMode;
+    }
+    return p;
+  };
+
   const next = clone(fills);
-  const target = next.find((p) => p.type === 'IMAGE');
-  if (target) {
-    target.imageHash = image.hash;
-  } else {
-    next.push({ type: 'IMAGE', scaleMode: 'FILL', imageHash: image.hash });
-  }
+  const i = next.findIndex((p) => p.type === 'IMAGE');
+  if (i >= 0) next[i] = cleanPaint(next[i]); // replace in place (keeps z-order)
+  else next.push(cleanPaint(null));          // e.g. a vector: paints inside its shape
   node.fills = next;
   figma.notify(`Updated "${node.name}" from Photoshop ✓`);
 }
