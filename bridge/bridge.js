@@ -10,6 +10,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { WebSocketServer } from 'ws';
@@ -23,6 +24,50 @@ initializeCanvas(createCanvas, (data, width, height) => {
   canvas.getContext('2d').putImageData(new ImageData(data, width, height), 0, 0);
   return canvas;
 });
+
+// --- security limits -------------------------------------------------------
+//
+// The bridge is a local endpoint that can write files and launch Photoshop, so
+// treat every inbound byte as hostile: bind loopback-only, require a pairing
+// token, and bound anything we parse before handing it to a decoder.
+
+const MAX_PAYLOAD = 64 * 1024 * 1024;      // WebSocket frame cap (~48MB of PSD after base64)
+const MAX_PSD_BYTES = 48 * 1024 * 1024;    // reject bigger PSDs before parsing
+const MAX_PNG_BYTES = 32 * 1024 * 1024;
+const MAX_DIM = 30000;                     // PSD format ceiling
+const MAX_PIXELS = 80e6;                   // guards decompression bombs (80 MP)
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+// Figma's plugin iframe is sandboxed, so it reports Origin "null". That's
+// spoofable by any sandboxed iframe, so this only blocks naive drive-by pages —
+// the pairing token is the real gate. Non-browser clients send no Origin.
+const ALLOWED_ORIGINS = new Set(['null', 'https://www.figma.com', 'https://figma.com']);
+
+// Validate a PSD's header *before* parsing it. Reading width/height straight
+// from the 26-byte header lets us reject absurd/hostile files cheaply.
+export function assertSafePsd(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 26) throw new Error('Not a valid PSD file');
+  if (buf.toString('ascii', 0, 4) !== '8BPS') throw new Error('Not a PSD file (bad signature)');
+  if (buf.length > MAX_PSD_BYTES) {
+    throw new Error(`PSD too large: ${(buf.length / 1048576) | 0}MB (max ${MAX_PSD_BYTES / 1048576}MB)`);
+  }
+  const height = buf.readUInt32BE(14);
+  const width = buf.readUInt32BE(18);
+  if (width < 1 || height < 1 || width > MAX_DIM || height > MAX_DIM) {
+    throw new Error(`Refusing PSD with unreasonable dimensions ${width}×${height}`);
+  }
+  if (width * height > MAX_PIXELS) {
+    throw new Error(`Refusing PSD with ${((width * height) / 1e6) | 0}MP (max ${MAX_PIXELS / 1e6}MP)`);
+  }
+  return { width, height };
+}
+
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+export function assertSafePng(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 8) throw new Error('Not a valid PNG');
+  if (!buf.subarray(0, 8).equals(PNG_MAGIC)) throw new Error('Not a PNG file');
+  if (buf.length > MAX_PNG_BYTES) throw new Error(`PNG too large (max ${MAX_PNG_BYTES / 1048576}MB)`);
+  return true;
+}
 
 // --- PSD -> PNG ------------------------------------------------------------
 
@@ -169,16 +214,51 @@ export function createBridge(options = {}) {
 
   const emitter = new EventEmitter();
   const watchers = new Map(); // nodeId -> chokidar watcher
-  const clients = new Set(); // connected Figma plugin UIs
-  const staging = new Map(); // importId -> raw PSD bytes, awaiting a Figma node id
+  const clients = new Set(); // authenticated Figma plugin UIs only
+  const staging = new Map(); // importId -> { buf, at }, awaiting a Figma node id
   let server = null;
   let wss = null;
+
+  // --- pairing token -------------------------------------------------------
+  // Anyone on this machine (including a web page in the user's browser) can
+  // reach a loopback port, so commands require a shared secret the user copies
+  // from the app once. Stored 0600 in the user's own data dir.
+  const tokenFile = path.join(dataDir, 'token');
+  function loadOrCreateToken() {
+    try {
+      const t = fs.readFileSync(tokenFile, 'utf8').trim();
+      if (t.length >= 32) return t;
+    } catch {}
+    const t = crypto.randomBytes(24).toString('hex');
+    fs.writeFileSync(tokenFile, t, { mode: 0o600 });
+    try { fs.chmodSync(tokenFile, 0o600); } catch {}
+    return t;
+  }
+  const token = loadOrCreateToken();
+  function validToken(candidate) {
+    if (typeof candidate !== 'string') return false;
+    const a = Buffer.from(candidate);
+    const b = Buffer.from(token);
+    // Length check first — timingSafeEqual throws on length mismatch.
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
 
   const loadIndex = () => {
     try { return JSON.parse(fs.readFileSync(indexFile, 'utf8')); } catch { return {}; }
   };
   const saveIndex = (ix) => fs.writeFileSync(indexFile, JSON.stringify(ix, null, 2));
   const sanitize = (s) => String(s).replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 60);
+
+  // index.json lives on disk; never let a tampered entry escape psdDir.
+  const safeEntryFile = (file) =>
+    (typeof file === 'string' && file && !file.includes('..') && file === path.basename(file)) ? file : null;
+
+  // Drop staged imports that were never bound (bounded memory).
+  const STAGING_TTL_MS = 10 * 60 * 1000;
+  function pruneStaging() {
+    const now = Date.now();
+    for (const [id, v] of staging) if (now - v.at > STAGING_TTL_MS) staging.delete(id);
+  }
 
   function broadcast(obj) {
     const s = JSON.stringify(obj);
@@ -197,7 +277,9 @@ export function createBridge(options = {}) {
     });
     w.on('change', () => {
       try {
-        const { png } = compositePreview(fs.readFileSync(psdPath));
+        const buf = fs.readFileSync(psdPath);
+        assertSafePsd(buf); // the file on disk could have been swapped
+        const { png } = compositePreview(buf);
         broadcast({ t: 'updated', nodeId, png: png.toString('base64') });
         log(`Saved → pushed back to Figma: ${path.basename(psdPath)}`);
       } catch (e) {
@@ -209,13 +291,17 @@ export function createBridge(options = {}) {
   }
 
   async function handleOpen({ nodeId, name, png, force }) {
+    if (typeof nodeId !== 'string' || !nodeId) throw new Error('Invalid nodeId');
     const ix = loadIndex();
     let entry = ix[nodeId];
-    const existing = entry && fs.existsSync(path.join(psdDir, entry.file));
+    const entryFile = entry && safeEntryFile(entry.file);
+    const existing = entryFile && fs.existsSync(path.join(psdDir, entryFile));
 
     if (force || !existing) {
+      const pngBuf = Buffer.from(String(png || ''), 'base64');
+      assertSafePng(pngBuf);
       const file = `${sanitize(name || 'image')}_${sanitize(nodeId)}.psd`;
-      await buildPsdFromPng(Buffer.from(png, 'base64'), path.join(psdDir, file));
+      await buildPsdFromPng(pngBuf, path.join(psdDir, file));
       entry = { file, name };
       ix[nodeId] = entry;
       saveIndex(ix);
@@ -224,19 +310,23 @@ export function createBridge(options = {}) {
       log(`Reopening PSD for "${name || nodeId}" (your layers are preserved)`);
     }
 
-    const psdPath = path.join(psdDir, entry.file);
+    const finalFile = safeEntryFile(entry.file);
+    if (!finalFile) throw new Error('Invalid PSD entry');
+    const psdPath = path.join(psdDir, finalFile);
     watch(nodeId, psdPath);
     openInPhotoshop(psdPath, photoshopApp);
-    broadcast({ t: 'opened', nodeId, file: entry.file });
+    broadcast({ t: 'opened', nodeId, file: finalFile });
   }
 
   // Step 1 of "Place PSD": render a flat preview, keep the layered PSD staged
   // until the plugin creates a Figma node and tells us its id.
   function handleImport({ psd, name }) {
-    const buf = Buffer.from(psd, 'base64');
+    const buf = Buffer.from(String(psd || ''), 'base64');
+    assertSafePsd(buf); // signature + size + dimensions, before any parsing
+    pruneStaging();
     const { png, width, height } = compositePreview(buf);
-    const importId = `imp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    staging.set(importId, buf);
+    const importId = `imp_${crypto.randomBytes(9).toString('hex')}`;
+    staging.set(importId, { buf, at: Date.now() });
     broadcast({ t: 'imported', importId, name, width, height, png: png.toString('base64') });
     log(`Imported layered PSD "${name}" (${width}×${height}px) — placing in Figma`);
   }
@@ -244,11 +334,12 @@ export function createBridge(options = {}) {
   // Step 2: bind the staged PSD to the node the plugin just created, so future
   // "Edit in Photoshop" on that image opens these original layers.
   function handleBind({ importId, nodeId, name }) {
-    const buf = staging.get(importId);
-    if (!buf) { log(`Bind failed: import ${importId} expired`); return; }
+    if (typeof nodeId !== 'string' || !nodeId) throw new Error('Invalid nodeId');
+    const staged = staging.get(importId);
+    if (!staged) { log(`Bind failed: import ${importId} expired`); return; }
     staging.delete(importId);
     const file = `${sanitize(name || 'image')}_${sanitize(nodeId)}.psd`;
-    fs.writeFileSync(path.join(psdDir, file), buf);
+    fs.writeFileSync(path.join(psdDir, file), staged.buf);
     const ix = loadIndex();
     ix[nodeId] = { file, name };
     saveIndex(ix);
@@ -257,7 +348,13 @@ export function createBridge(options = {}) {
 
   function start() {
     if (server) return;
+    const loopbackHost = (req) =>
+      LOOPBACK_HOSTS.has(String(req.headers.host || '').split(':')[0].replace(/^\[|\]$/g, ''));
+
     server = http.createServer((req, res) => {
+      // Anti-DNS-rebinding: a page that resolves its own domain to 127.0.0.1
+      // still sends its own Host header, so require a loopback Host.
+      if (!loopbackHost(req)) { res.writeHead(403); res.end('Forbidden'); return; }
       if (req.url === '/health') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true, platform: process.platform }));
@@ -266,14 +363,48 @@ export function createBridge(options = {}) {
       res.writeHead(200, { 'content-type': 'text/plain' });
       res.end('Figshop bridge is running.');
     });
-    wss = new WebSocketServer({ server, maxPayload: 256 * 1024 * 1024 });
+
+    wss = new WebSocketServer({
+      server,
+      maxPayload: MAX_PAYLOAD,
+      verifyClient: ({ origin, req }, done) => {
+        if (!loopbackHost(req)) return done(false, 403, 'Forbidden');
+        // Browsers always send Origin; native clients send none. Blocks a
+        // drive-by page outright — the token still gates everything else.
+        if (origin !== undefined && !ALLOWED_ORIGINS.has(origin)) return done(false, 403, 'Forbidden');
+        done(true);
+      },
+    });
+
     wss.on('connection', (ws) => {
-      clients.add(ws);
-      ws.send(JSON.stringify({ t: 'ready', platform: process.platform }));
-      log('Figma plugin connected.');
+      // Unauthenticated until it proves it holds the pairing token: it receives
+      // no broadcasts and can run no commands until then.
+      let authed = false;
+      const authTimer = setTimeout(() => {
+        if (!authed) {
+          try { ws.send(JSON.stringify({ t: 'auth-required' })); } catch {}
+          ws.close(4401, 'unauthorized');
+        }
+      }, 5000);
+
       ws.on('message', async (data) => {
         let msg;
         try { msg = JSON.parse(data.toString()); } catch { return; }
+
+        if (!authed) {
+          if (msg.t === 'auth' && validToken(msg.token)) {
+            authed = true;
+            clearTimeout(authTimer);
+            clients.add(ws);
+            ws.send(JSON.stringify({ t: 'ready', platform: process.platform }));
+            log('Figma plugin paired and connected.');
+          } else {
+            try { ws.send(JSON.stringify({ t: 'auth-required' })); } catch {}
+            ws.close(4401, 'unauthorized');
+          }
+          return;
+        }
+
         try {
           if (msg.t === 'open') await handleOpen(msg);
           else if (msg.t === 'import') handleImport(msg);
@@ -283,11 +414,16 @@ export function createBridge(options = {}) {
           ws.send(JSON.stringify({ t: 'error', nodeId: msg?.nodeId, message: e.message }));
         }
       });
-      ws.on('close', () => clients.delete(ws));
+
+      const cleanup = () => { clearTimeout(authTimer); clients.delete(ws); };
+      ws.on('close', cleanup);
+      ws.on('error', cleanup);
     });
+
     server.on('error', (e) => log(`Server error: ${e.message}`));
-    server.listen(port, () => {
-      log(`Bridge listening on http://localhost:${port}`);
+    // Loopback only: never reachable from the LAN/Wi-Fi.
+    server.listen(port, '127.0.0.1', () => {
+      log(`Bridge listening on http://127.0.0.1:${port} (loopback only)`);
       emitter.emit('status', { running: true, port });
     });
   }
@@ -307,5 +443,6 @@ export function createBridge(options = {}) {
     start, stop,
     get running() { return !!server; },
     port, photoshopApp, dataDir, psdDir,
+    token, // shown/copied by the app so the user can pair the plugin
   });
 }

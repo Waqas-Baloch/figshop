@@ -14,10 +14,22 @@ const command = figma.command || 'connect';
 
 figma.ui.onmessage = async (msg) => {
   switch (msg.type) {
-    case 'ui-ready':
+    case 'ui-ready': {
+      // Hand the UI the saved pairing token so it can authenticate to the
+      // companion app. Stored per-user by Figma, entered once.
+      const saved = await figma.clientStorage.getAsync('pairingToken');
+      figma.ui.postMessage({ type: 'config', token: saved || '' });
       if (command === 'edit') await editSelection(false);
       else if (command === 'reset') await editSelection(true);
       break;
+    }
+    case 'save-token': {
+      const t = String(msg.token || '').trim();
+      await figma.clientStorage.setAsync('pairingToken', t);
+      figma.ui.postMessage({ type: 'config', token: t });
+      figma.notify('Pairing code saved.');
+      break;
+    }
     case 'edit':
       await editSelection(false);
       break;

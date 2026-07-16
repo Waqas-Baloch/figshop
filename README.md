@@ -141,6 +141,36 @@ Why Electron and not Tauri: the bridge is Node + a native canvas module
 loads on both platforms with **no rebuild**. `desktop/bridge.mjs` is generated from
 `bridge/bridge.js` by `npm run sync-core` — single source of truth.
 
+## Security
+
+The companion app is a local endpoint that can write files and launch Photoshop, so
+it treats every inbound byte as untrusted:
+
+- **Loopback only.** The bridge binds `127.0.0.1` — it is *not* reachable from your
+  network/Wi-Fi.
+- **Paired, not open.** Every command requires a random 192-bit token (stored `0600`),
+  copied once from the menu-bar app into the plugin. Unauthenticated sockets receive
+  nothing and are closed (`4401`).
+- **Drive-by / DNS-rebinding resistant.** Non-loopback `Host` headers and unknown
+  `Origin`s are rejected at the WebSocket handshake.
+- **Bounded parsing.** 64 MB frame cap; PSDs are checked for signature, size,
+  dimensions and total pixel count *before* reaching a decoder (rejects
+  decompression bombs).
+- **No path traversal.** Filenames are sanitized and confined to `~/.figshop/psd`.
+- **Opt-in autostart.** Launch-at-login is asked for, never enabled silently.
+- **Verifiable builds.** Each release publishes SHA-256 checksums and GitHub build
+  provenance: `gh attestation verify <file> --repo Waqas-Baloch/figshop`.
+- **Nothing leaves your machine.** No servers, accounts, telemetry, or third parties.
+
+Adversarial test suite (loopback, auth, origin/host, payload bombs, traversal):
+
+```bash
+cd bridge && npm test
+```
+
+**Not yet done:** the app isn't notarized / Authenticode-signed (needs paid certs), so
+first launch still shows an "unverified developer" prompt.
+
 ## Known limits
 
 - The image returns to Figma **flattened** (Figma can't host a live PSD) — your layers

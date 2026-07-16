@@ -7,6 +7,7 @@
     body { color: #e6e6e6; background: #1e1e1e; }
     .log, .setup { background: #111; border-color: #333; }
     button.ghost { color: #ccc; border-color: #444; }
+    input { background: #1b1b1b; color: #eee; border-color: #444; }
   }
   .status { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-weight: 600; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: #d33; box-shadow: 0 0 0 3px rgba(221,51,51,.15); }
@@ -15,25 +16,35 @@
   button { width: 100%; padding: 9px 12px; margin-bottom: 8px; border: 0; border-radius: 7px; font: inherit; font-weight: 600; cursor: pointer; background: #0d99ff; color: #fff; }
   button.ghost { background: transparent; color: #555; border: 1px solid #ddd; font-weight: 500; }
   button:active { transform: translateY(1px); }
-  button:disabled { opacity: .45; cursor: default; }
+  input { width: 100%; box-sizing: border-box; padding: 8px 10px; margin-bottom: 8px; border: 1px solid #ddd; border-radius: 7px; font: inherit; }
   .hint { color: #888; font-size: 11px; margin: 2px 0 12px; }
   .setup { border: 1px solid #ffe0a3; background: #fff8ec; border-radius: 8px; padding: 11px; margin-bottom: 12px; }
   .setup h3 { margin: 0 0 4px; font-size: 12px; }
   .setup p { margin: 0 0 9px; color: #8a6d3b; font-size: 11px; }
   @media (prefers-color-scheme: dark) { .setup { border-color: #5a4a1f; background: #2a230f; } .setup p { color: #d9b96b; } }
-  .log { height: 110px; overflow: auto; padding: 8px; border: 1px solid #eee; border-radius: 7px; background: #fafafa; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  .log { height: 100px; overflow: auto; padding: 8px; border: 1px solid #eee; border-radius: 7px; background: #fafafa; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
   .hidden { display: none; }
 </style>
 
 <div class="status"><span class="dot wait" id="dot"></span><span id="statusText">Looking for the companion app…</span></div>
 
-<!-- Shown only when the helper isn't running -->
+<!-- shown when the companion app isn't running -->
 <div class="setup hidden" id="setup">
   <h3>One-time setup</h3>
-  <p id="setupText">Install the free companion app — it opens your images in Photoshop and
+  <p>Install the free companion app — it opens your images in Photoshop and
     syncs edits back. After installing, this panel connects automatically.</p>
-  <button id="download">Install Figshop helper</button>
+  <button id="download">Install companion app</button>
   <button id="retry" class="ghost">I've installed it — retry</button>
+</div>
+
+<!-- shown when the app is running but this plugin isn't paired yet -->
+<div class="setup hidden" id="pair">
+  <h3>Pair with the companion app</h3>
+  <p>For security, the app only accepts commands from a paired plugin. Click the
+    Figshop icon in your menu bar → <b>Copy pairing code</b>, then paste it below.
+    You only do this once.</p>
+  <input id="pairInput" placeholder="Paste pairing code" autocomplete="off" spellcheck="false" />
+  <button id="pairSave">Pair</button>
 </div>
 
 <button id="edit">Edit selected image in Photoshop</button>
@@ -45,93 +56,105 @@
 <div class="log" id="log"></div>
 
 <script>
-  const BRIDGE = 'ws://localhost:3900';
-  // Published installers (the CI release-on-tag publishes the .dmg / .exe here).
+  // Loopback address (not "localhost") so we always hit the IPv4 socket the
+  // bridge binds to.
+  const BRIDGE = 'ws://127.0.0.1:3900';
   const RELEASES_URL = 'https://github.com/Waqas-Baloch/figshop/releases/latest';
-  const WAKE_URL = 'figshop://wake'; // launches the helper if installed but not running
+  const WAKE_URL = 'figshop://wake';
 
   const isWin = /Win/i.test(navigator.userAgent);
-  const dot = document.getElementById('dot');
-  const statusText = document.getElementById('statusText');
-  const setup = document.getElementById('setup');
-  const logEl = document.getElementById('log');
-  document.getElementById('setupText'); // (kept generic for both OSes)
-  document.getElementById('download').textContent = 'Install companion app for ' + (isWin ? 'Windows' : 'macOS');
+  const $ = (id) => document.getElementById(id);
+  const dot = $('dot'), statusText = $('statusText'), setup = $('setup'), pair = $('pair'), logEl = $('log');
+  $('download').textContent = 'Install companion app for ' + (isWin ? 'Windows' : 'macOS');
 
   const toPlugin = (m) => parent.postMessage({ pluginMessage: m }, '*');
-  function log(line) { const t = new Date().toLocaleTimeString(); logEl.textContent += `[${t}] ${line}\n`; logEl.scrollTop = logEl.scrollHeight; }
+  const log = (line) => { const t = new Date().toLocaleTimeString(); logEl.textContent += `[${t}] ${line}\n`; logEl.scrollTop = logEl.scrollHeight; };
 
-  let connected = false;
+  let token = '';
+  let connected = false;   // authenticated
   let everConnected = false;
-  function setState(state) {
-    dot.className = 'dot' + (state === 'on' ? ' on' : state === 'wait' ? ' wait' : '');
+  let ws, queue = [];
+
+  function setState(s) {
+    dot.className = 'dot' + (s === 'on' ? ' on' : s === 'wait' ? ' wait' : '');
     statusText.textContent =
-      state === 'on' ? 'Connected ✓' :
-      state === 'wait' ? 'Looking for the companion app…' :
+      s === 'on' ? 'Connected ✓' :
+      s === 'wait' ? 'Looking for the companion app…' :
+      s === 'pair' ? 'Pairing required' :
       'Companion app not running';
-    setup.classList.toggle('hidden', state === 'on');
+    setup.classList.toggle('hidden', s !== 'off');
+    pair.classList.toggle('hidden', s !== 'pair');
   }
 
-  // --- WebSocket to the local helper, with auto-reconnect + first-run grace ---
-  let ws, queue = [];
   function connect() {
+    try { if (ws) ws.close(); } catch {}
     ws = new WebSocket(BRIDGE);
     ws.onopen = () => {
-      connected = true; everConnected = true;
-      setState('on'); log('Connected to helper.');
-      queue.forEach((m) => ws.send(m)); queue = [];
+      everConnected = true;
+      // Prove we hold the pairing token before anything else is accepted.
+      ws.send(JSON.stringify({ t: 'auth', token }));
     };
-    ws.onclose = () => { connected = false; setState(everConnected ? 'off' : 'wait'); setTimeout(connect, 1500); };
-    ws.onerror = () => ws.close();
+    ws.onclose = (e) => {
+      connected = false;
+      if (e.code === 4401) { setState('pair'); return; } // don't hammer; wait for a code
+      setState(everConnected ? 'off' : 'wait');
+      setTimeout(connect, 1500);
+    };
+    ws.onerror = () => { try { ws.close(); } catch {} };
     ws.onmessage = (ev) => {
       const msg = JSON.parse(ev.data);
-      if (msg.t === 'updated') toPlugin({ type: 'apply', nodeId: msg.nodeId, png: msg.png });
+      if (msg.t === 'ready') {                 // auth accepted
+        connected = true; setState('on'); log('Paired and connected.');
+        queue.forEach((m) => ws.send(m)); queue = [];
+      }
+      else if (msg.t === 'auth-required') { setState('pair'); log('Pairing code needed.'); }
+      else if (msg.t === 'updated') toPlugin({ type: 'apply', nodeId: msg.nodeId, png: msg.png });
       else if (msg.t === 'imported') toPlugin({ type: 'place', importId: msg.importId, name: msg.name, width: msg.width, height: msg.height, png: msg.png });
       else if (msg.t === 'opened') log(`Opened in Photoshop: ${msg.file}`);
       else if (msg.t === 'log') log(msg.message);
       else if (msg.t === 'error') log('⚠ ' + msg.message);
-      else if (msg.t === 'ready') log('Helper ready.');
     };
   }
-  // If we haven't connected shortly after opening, the helper isn't installed/running.
-  setTimeout(() => { if (!connected) setState('off'); }, 2500);
+  setTimeout(() => { if (!connected && !everConnected) setState('off'); }, 2500);
+
   function send(obj) {
     const s = JSON.stringify(obj);
     if (connected && ws.readyState === 1) ws.send(s);
-    else { queue.push(s); setState('off'); attemptWake(); } // reveal setup, try to launch helper
+    else { queue.push(s); if (!everConnected) { setState('off'); attemptWake(); } }
   }
-  function attemptWake() { toPlugin({ type: 'open-url', url: WAKE_URL }); } // best-effort; no-op if not installed
-  connect();
+  const attemptWake = () => toPlugin({ type: 'open-url', url: WAKE_URL });
 
   // --- messages from the plugin main thread --------------------------------
   onmessage = (event) => {
     const msg = event.data.pluginMessage; if (!msg) return;
-    if (msg.type === 'open') send({ t: 'open', nodeId: msg.nodeId, name: msg.name, png: msg.png, force: msg.force });
+    if (msg.type === 'config') { token = msg.token || ''; connect(); }
+    else if (msg.type === 'open') send({ t: 'open', nodeId: msg.nodeId, name: msg.name, png: msg.png, force: msg.force });
     else if (msg.type === 'bind') send({ t: 'bind', importId: msg.importId, nodeId: msg.nodeId, name: msg.name });
     else if (msg.type === 'log') log(msg.message);
   };
 
   // --- buttons -------------------------------------------------------------
-  document.getElementById('edit').onclick = () => { if (!connected) attemptWake(); toPlugin({ type: 'edit' }); };
-  document.getElementById('reset').onclick = () => toPlugin({ type: 'reset' });
-  document.getElementById('place').onclick = () => {
-    if (!connected) { attemptWake(); setState('off'); log('Install the companion app first, then Place a PSD.'); return; }
-    document.getElementById('psdFile').click();
+  $('edit').onclick = () => { if (!connected) attemptWake(); toPlugin({ type: 'edit' }); };
+  $('reset').onclick = () => toPlugin({ type: 'reset' });
+  $('place').onclick = () => {
+    if (!connected) { attemptWake(); log('Connect and pair the companion app first.'); return; }
+    $('psdFile').click();
   };
-  document.getElementById('psdFile').onchange = (e) => {
-    const f = e.target.files[0];
-    if (!f) return;
+  $('psdFile').onchange = (e) => {
+    const f = e.target.files[0]; if (!f) return;
     const reader = new FileReader();
-    reader.onload = () => {
-      const d = reader.result; // data:...;base64,XXXX
-      send({ t: 'import', psd: d.slice(d.indexOf(',') + 1), name: f.name });
-      log('Uploading PSD: ' + f.name + '…');
-    };
+    reader.onload = () => { const d = reader.result; send({ t: 'import', psd: d.slice(d.indexOf(',') + 1), name: f.name }); log('Uploading PSD: ' + f.name + '…'); };
     reader.readAsDataURL(f);
-    e.target.value = ''; // allow re-selecting the same file
+    e.target.value = '';
   };
-  document.getElementById('download').onclick = () => { toPlugin({ type: 'open-url', url: RELEASES_URL }); log('Opening the installer download…'); };
-  document.getElementById('retry').onclick = () => { log('Retrying…'); attemptWake(); try { ws.close(); } catch {} };
+  $('pairSave').onclick = () => {
+    const v = $('pairInput').value.trim();
+    if (!v) return;
+    toPlugin({ type: 'save-token', token: v }); // main stores it, then sends config back
+    log('Pairing…');
+  };
+  $('download').onclick = () => { toPlugin({ type: 'open-url', url: RELEASES_URL }); log('Opening the installer download…'); };
+  $('retry').onclick = () => { log('Retrying…'); attemptWake(); connect(); };
 
-  toPlugin({ type: 'ui-ready' });
+  toPlugin({ type: 'ui-ready' }); // main replies with { type:'config', token }
 </script>

@@ -4,7 +4,7 @@
 // Node install required on the user's machine. It runs the same bridge core as
 // the CLI (bridge.mjs, synced from ../bridge/bridge.js) and exposes a tray menu.
 
-const { app, Tray, Menu, nativeImage, shell } = require('electron');
+const { app, Tray, Menu, nativeImage, shell, dialog, clipboard } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -45,12 +45,23 @@ app.setAsDefaultProtocolClient('figshop');
 app.on('open-url', (event) => { event.preventDefault(); }); // macOS deep-link
 
 app.whenReady().then(async () => {
-  // Zero-config "always on": enable launch-at-login automatically the first time
-  // (both macOS and Windows). We only do it once so a later opt-out sticks.
-  if (!cfg.loginConfigured) {
-    app.setLoginItemSettings({ openAtLogin: true });
-    cfg.loginConfigured = true;
+  // Launch-at-login is opt-in: ask once, and honour the answer. (Earlier builds
+  // enabled it silently — this also gives those users an explicit choice, and
+  // turns it off if they decline.)
+  if (!cfg.loginPrompted) {
+    cfg.loginPrompted = true;
     saveConfig();
+    const { response } = await dialog.showMessageBox({
+      type: 'question',
+      buttons: ['Not now', 'Start at login'],
+      defaultId: 1,
+      cancelId: 0,
+      message: 'Start Figshop automatically at login?',
+      detail:
+        'Figshop must be running for the Figma plugin to reach Photoshop. ' +
+        'You can change this any time from the menu-bar icon.',
+    });
+    app.setLoginItemSettings({ openAtLogin: response === 1 });
   }
 
   tray = new Tray(trayImage());
@@ -97,6 +108,23 @@ function updateMenu() {
       type: 'checkbox',
       checked: openAtLogin,
       click: (item) => { app.setLoginItemSettings({ openAtLogin: item.checked }); updateMenu(); },
+    },
+    { type: 'separator' },
+    {
+      label: 'Copy pairing code',
+      enabled: !!(bridge && bridge.token),
+      // The plugin must present this token before the bridge accepts any
+      // command, so a random local process/web page can't drive Photoshop.
+      click: () => {
+        clipboard.writeText(bridge.token);
+        fileLog('Pairing code copied to clipboard.');
+        dialog.showMessageBox({
+          type: 'info',
+          message: 'Pairing code copied',
+          detail: 'Paste it into the Figma plugin panel to pair. You only need to do this once.',
+          buttons: ['OK'],
+        });
+      },
     },
     { type: 'separator' },
     { label: 'Open log…', click: () => shell.openPath(LOG_FILE) },

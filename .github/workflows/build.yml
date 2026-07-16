@@ -65,17 +65,48 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write      # required to sign the provenance attestation
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
       - run: ls -R artifacts
+      - name: SHA-256 checksums
+        run: |
+          find artifacts -type f \( -name '*.dmg' -o -name '*.exe' \) -print0 \
+            | xargs -0 sha256sum | sed 's|artifacts/[^/]*/||' | tee SHA256SUMS.txt
+      # Cryptographically ties each installer to this repo + commit + workflow,
+      # so users can prove the binary came from this source and wasn't swapped.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'artifacts/installer-mac/*.dmg, artifacts/installer-win/*.exe'
       - name: Publish Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          {
+            echo "Figshop companion app installers."
+            echo ""
+            echo "The bridge listens on loopback only (127.0.0.1) and requires a pairing"
+            echo "code before it accepts any command."
+            echo ""
+            echo "First launch — macOS: right-click ▸ Open. Windows: More info ▸ Run anyway."
+            echo "(Unsigned; see the repo for notarization status.)"
+            echo ""
+            echo "### SHA-256"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+            echo ""
+            echo "### Verify build provenance"
+            echo '```'
+            echo "gh attestation verify <downloaded-file> --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+          } > notes.md
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "Figshop ${GITHUB_REF_NAME}" \
-            --notes "Figshop helper installers. macOS users: right-click ▸ Open the first time (unsigned). Windows users: More info ▸ Run anyway." \
-            artifacts/installer-mac/*.dmg artifacts/installer-win/*.exe
+            --notes-file notes.md \
+            artifacts/installer-mac/*.dmg artifacts/installer-win/*.exe SHA256SUMS.txt

@@ -15,7 +15,7 @@
     { "command": "edit", "name": "Edit in Photoshop" }
   ],
   "networkAccess": {
-    "allowedDomains": ["http://localhost:3900", "ws://localhost:3900"],
-    "reasoning": "Connects to the local companion app to send images to Photoshop and receive edits back."
+    "allowedDomains": ["http://127.0.0.1:3900", "ws://127.0.0.1:3900", "http://localhost:3900", "ws://localhost:3900"],
+    "reasoning": "Connects only to a companion app on the user's own computer (loopback) to send images to Photoshop and receive edits back. No data leaves the device."
   }
 }
