@@ -72,8 +72,9 @@
   const log = (line) => { const t = new Date().toLocaleTimeString(); logEl.textContent += `[${t}] ${line}\n`; logEl.scrollTop = logEl.scrollHeight; };
 
   let token = '';
-  let connected = false;   // authenticated
+  let connected = false;    // authenticated
   let everConnected = false;
+  let graceExpired = false; // after the grace period, "unreachable" means "not installed/running"
   let ws, queue = [];
 
   function setState(s) {
@@ -98,7 +99,9 @@
     ws.onclose = (e) => {
       connected = false;
       if (e.code === 4401) { setState('pair'); return; } // don't hammer; wait for a code
-      setState(everConnected ? 'off' : 'wait');
+      // Once the grace period is up, a failed connect means the app isn't
+      // running — show the install panel and keep it shown while we retry.
+      setState(graceExpired ? 'off' : 'wait');
       setTimeout(connect, 1500);
     };
     ws.onerror = () => { try { ws.close(); } catch {} };
@@ -116,12 +119,12 @@
       else if (msg.t === 'error') log('⚠ ' + msg.message);
     };
   }
-  setTimeout(() => { if (!connected && !everConnected) setState('off'); }, 2500);
+  setTimeout(() => { graceExpired = true; if (!connected) setState('off'); }, 2500);
 
   function send(obj) {
     const s = JSON.stringify(obj);
     if (connected && ws.readyState === 1) ws.send(s);
-    else { queue.push(s); if (!everConnected) { setState('off'); attemptWake(); } }
+    else { queue.push(s); attemptWake(); } // state is already 'off'/'pair'
   }
   const attemptWake = () => toPlugin({ type: 'open-url', url: WAKE_URL });
 

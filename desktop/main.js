@@ -45,13 +45,33 @@ app.setAsDefaultProtocolClient('figshop');
 app.on('open-url', (event) => { event.preventDefault(); }); // macOS deep-link
 
 app.whenReady().then(async () => {
-  // Launch-at-login is opt-in: ask once, and honour the answer. (Earlier builds
-  // enabled it silently — this also gives those users an explicit choice, and
-  // turns it off if they decline.)
+  tray = new Tray(trayImage());
+  tray.setToolTip('Figshop bridge');
+  updateMenu();
+
+  // Start the bridge FIRST. Nothing may block this — see the login prompt below.
+  try {
+    const core = await import(pathToFileURL(path.join(__dirname, 'bridge.mjs')).href);
+    bridge = core.createBridge({ port: PORT, photoshopApp: PHOTOSHOP_APP });
+    bridge.on('log', fileLog);
+    bridge.on('status', (s) => { status = s; updateMenu(); });
+    bridge.start();
+    updateMenu(); // the pairing-code item needs the bridge
+  } catch (e) {
+    fileLog('Failed to start bridge: ' + (e && e.stack || e));
+    status = { running: false, error: String(e && e.message || e) };
+    updateMenu();
+  }
+
+  // Launch-at-login is opt-in: ask once and honour the answer. (Earlier builds
+  // enabled it silently; this gives those users an explicit choice too.)
+  // Deliberately NOT awaited: this is a dock-less menu-bar app, so a modal
+  // dialog can sit unseen behind other windows — awaiting it here previously
+  // stopped the bridge from ever starting.
   if (!cfg.loginPrompted) {
     cfg.loginPrompted = true;
     saveConfig();
-    const { response } = await dialog.showMessageBox({
+    dialog.showMessageBox({
       type: 'question',
       buttons: ['Not now', 'Start at login'],
       defaultId: 1,
@@ -60,24 +80,10 @@ app.whenReady().then(async () => {
       detail:
         'Figshop must be running for the Figma plugin to reach Photoshop. ' +
         'You can change this any time from the menu-bar icon.',
-    });
-    app.setLoginItemSettings({ openAtLogin: response === 1 });
-  }
-
-  tray = new Tray(trayImage());
-  tray.setToolTip('Figshop bridge');
-  updateMenu();
-
-  try {
-    const core = await import(pathToFileURL(path.join(__dirname, 'bridge.mjs')).href);
-    bridge = core.createBridge({ port: PORT, photoshopApp: PHOTOSHOP_APP });
-    bridge.on('log', fileLog);
-    bridge.on('status', (s) => { status = s; updateMenu(); });
-    bridge.start();
-  } catch (e) {
-    fileLog('Failed to start bridge: ' + (e && e.stack || e));
-    status = { running: false, error: String(e && e.message || e) };
-    updateMenu();
+    }).then(({ response }) => {
+      app.setLoginItemSettings({ openAtLogin: response === 1 });
+      updateMenu();
+    }).catch((e) => fileLog('Login prompt failed: ' + e.message));
   }
 });
 
