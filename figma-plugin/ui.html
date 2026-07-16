@@ -56,9 +56,10 @@
 <div class="log" id="log"></div>
 
 <script>
-  // Loopback address (not "localhost") so we always hit the IPv4 socket the
-  // bridge binds to.
-  const BRIDGE = 'ws://127.0.0.1:3900';
+  // Figma's manifest only allows hostnames in allowedDomains (not IP literals),
+  // so we dial "localhost". The bridge binds both 127.0.0.1 and ::1, so this
+  // resolves either way — and stays loopback-only.
+  const BRIDGE = 'ws://localhost:3900';
   const RELEASES_URL = 'https://github.com/Waqas-Baloch/figshop/releases/latest';
   const WAKE_URL = 'figshop://wake';
 

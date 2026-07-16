@@ -44,6 +44,17 @@ console.log('\n1) Network exposure');
     });
     ok(`not reachable from LAN ip ${lan.address} (loopback-only)`, !reachable);
   }
+  // Figma can only dial a hostname, so "localhost" must connect regardless of
+  // whether it resolves to ::1 or 127.0.0.1.
+  const dialable = (h) => new Promise((res) => {
+    const w = new WebSocket(`ws://${h}:${PORT}`);
+    w.on('open', () => { w.close(); res(true); });
+    w.on('error', () => res(false));
+    setTimeout(() => res(false), 1500);
+  });
+  ok('loopback 127.0.0.1 accepts connections', await dialable('127.0.0.1'));
+  ok('loopback [::1] accepts connections', await dialable('[::1]'));
+  ok('localhost resolves & connects (what the Figma plugin uses)', await dialable('localhost'));
 }
 
 console.log('\n2) Authentication');

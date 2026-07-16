@@ -37,6 +37,10 @@ const MAX_PNG_BYTES = 32 * 1024 * 1024;
 const MAX_DIM = 30000;                     // PSD format ceiling
 const MAX_PIXELS = 80e6;                   // guards decompression bombs (80 MP)
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+// Bind BOTH loopback addresses: Figma's manifest only allows hostnames (not IP
+// literals), so the plugin must dial "localhost" — which may resolve to ::1 or
+// 127.0.0.1 depending on the machine. Both are loopback; neither is on the LAN.
+const LOOPBACK_BIND = ['127.0.0.1', '::1'];
 // Figma's plugin iframe is sandboxed, so it reports Origin "null". That's
 // spoofable by any sandboxed iframe, so this only blocks naive drive-by pages —
 // the pairing token is the real gate. Non-browser clients send no Origin.
@@ -216,7 +220,8 @@ export function createBridge(options = {}) {
   const watchers = new Map(); // nodeId -> chokidar watcher
   const clients = new Set(); // authenticated Figma plugin UIs only
   const staging = new Map(); // importId -> { buf, at }, awaiting a Figma node id
-  let server = null;
+  const servers = []; // one per loopback address
+  let running = false;
   let wss = null;
 
   // --- pairing token -------------------------------------------------------
@@ -347,11 +352,11 @@ export function createBridge(options = {}) {
   }
 
   function start() {
-    if (server) return;
+    if (servers.length) return;
     const loopbackHost = (req) =>
-      LOOPBACK_HOSTS.has(String(req.headers.host || '').split(':')[0].replace(/^\[|\]$/g, ''));
+      LOOPBACK_HOSTS.has(String(req.headers.host || '').replace(/:\d+$/, '').replace(/^\[|\]$/g, ''));
 
-    server = http.createServer((req, res) => {
+    const httpHandler = (req, res) => {
       // Anti-DNS-rebinding: a page that resolves its own domain to 127.0.0.1
       // still sends its own Host header, so require a loopback Host.
       if (!loopbackHost(req)) { res.writeHead(403); res.end('Forbidden'); return; }
@@ -362,19 +367,25 @@ export function createBridge(options = {}) {
       }
       res.writeHead(200, { 'content-type': 'text/plain' });
       res.end('Figshop bridge is running.');
-    });
+    };
 
-    wss = new WebSocketServer({
-      server,
-      maxPayload: MAX_PAYLOAD,
-      verifyClient: ({ origin, req }, done) => {
-        if (!loopbackHost(req)) return done(false, 403, 'Forbidden');
-        // Browsers always send Origin; native clients send none. Blocks a
-        // drive-by page outright — the token still gates everything else.
-        if (origin !== undefined && !ALLOWED_ORIGINS.has(origin)) return done(false, 403, 'Forbidden');
-        done(true);
-      },
-    });
+    // noServer mode so one WebSocket server can accept upgrades from both
+    // loopback listeners. The handshake checks that verifyClient used to do
+    // now happen here.
+    wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD });
+
+    const rejectUpgrade = (socket) => {
+      try { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); } catch {}
+      socket.destroy();
+    };
+    const onUpgrade = (req, socket, head) => {
+      if (!loopbackHost(req)) return rejectUpgrade(socket);
+      // Browsers always send Origin; native clients send none. Blocks a
+      // drive-by page outright — the token still gates everything else.
+      const origin = req.headers.origin;
+      if (origin !== undefined && !ALLOWED_ORIGINS.has(origin)) return rejectUpgrade(socket);
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    };
 
     wss.on('connection', (ws) => {
       // Unauthenticated until it proves it holds the pairing token: it receives
@@ -420,12 +431,19 @@ export function createBridge(options = {}) {
       ws.on('error', cleanup);
     });
 
-    server.on('error', (e) => log(`Server error: ${e.message}`));
-    // Loopback only: never reachable from the LAN/Wi-Fi.
-    server.listen(port, '127.0.0.1', () => {
-      log(`Bridge listening on http://127.0.0.1:${port} (loopback only)`);
-      emitter.emit('status', { running: true, port });
-    });
+    // Loopback only: never reachable from the LAN/Wi-Fi. We bind 127.0.0.1 and
+    // ::1 so "localhost" reaches us regardless of how it resolves.
+    for (const host of LOOPBACK_BIND) {
+      const s = http.createServer(httpHandler);
+      s.on('upgrade', onUpgrade);
+      // ::1 can be unavailable (IPv6 disabled) — that's fine, 127.0.0.1 serves.
+      s.on('error', (e) => log(`Listen ${host}:${port} failed: ${e.code || e.message}`));
+      s.listen(port, host, () => {
+        if (!running) { running = true; emitter.emit('status', { running: true, port }); }
+        log(`Bridge listening on ${host}:${port} (loopback only)`);
+      });
+      servers.push(s);
+    }
   }
 
   function stop() {
@@ -434,14 +452,16 @@ export function createBridge(options = {}) {
     for (const c of clients) try { c.close(); } catch {}
     clients.clear();
     if (wss) { wss.close(); wss = null; }
-    if (server) { server.close(); server = null; }
+    for (const s of servers) { try { s.close(); } catch {} }
+    servers.length = 0;
+    running = false;
     emitter.emit('status', { running: false, port });
     log('Bridge stopped.');
   }
 
   return Object.assign(emitter, {
     start, stop,
-    get running() { return !!server; },
+    get running() { return running; },
     port, photoshopApp, dataDir, psdDir,
     token, // shown/copied by the app so the user can pair the plugin
   });
