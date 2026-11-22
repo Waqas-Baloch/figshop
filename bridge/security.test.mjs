@@ -1,6 +1,6 @@
 // Adversarial tests for the hardened bridge. Runs an isolated instance in a
 // temp data dir and tries to break in.
-import { createBridge } from './bridge.js';
+import { createBridge, assertSafePsd } from './bridge.js';
 import { WebSocket } from 'ws';
 import net from 'node:net';
 import http from 'node:http';
@@ -185,6 +185,46 @@ console.log('\n8) HTTP surface');
   ok('health rejects non-loopback Host (rebinding)', evil.status === 403, `status=${evil.status}`);
   ok('health leaks no pairing token', !good.body.includes(bridge.token), good.body);
   ok('health exposes no filesystem paths', !/\/Users\/|home\/|psd/i.test(good.body), good.body);
+}
+
+console.log('\n9) Robustness: large saved PSD is accepted; a save is detected');
+{
+  // A real edited PSD easily exceeds 48MB. An UPLOAD stays tightly capped, but a
+  // locally-saved file must not be rejected for size alone.
+  const header = Buffer.alloc(26);
+  header.write('8BPS', 0, 'ascii');
+  header.writeUInt16BE(1, 4); header.writeUInt16BE(3, 12);
+  header.writeUInt32BE(1000, 14); header.writeUInt32BE(1000, 18);
+  const big = Buffer.concat([header, Buffer.alloc(60 * 1024 * 1024)]); // 60MB, valid header
+  let importRejected = false, localOk = false;
+  try { assertSafePsd(big); } catch { importRejected = true; } // default = import tier
+  try { assertSafePsd(big, { maxBytes: 512 * 1024 * 1024, maxPixels: 200e6 }); localOk = true; } catch {}
+  ok('60MB PSD rejected as an untrusted upload', importRejected);
+  ok('60MB PSD accepted as a locally-saved file', localOk);
+
+  // End-to-end: bind a PSD, then "save" (overwrite the file) and confirm the new
+  // polling watcher detects it and pushes an update.
+  const rect = (w, h, col) => { const cv = createCanvas(w, h); cv.getContext('2d').fillStyle = col; cv.getContext('2d').fillRect(0, 0, w, h); return cv; };
+  const v1 = Buffer.from(writePsd({ width: 30, height: 20, canvas: rect(30, 20, '#112233'), children: [{ name: 'l', left: 0, top: 0, right: 30, bottom: 20, canvas: rect(30, 20, '#112233') }] }));
+  const v2 = Buffer.from(writePsd({ width: 30, height: 20, canvas: rect(30, 20, '#ffaa00'), children: [{ name: 'l', left: 0, top: 0, right: 30, bottom: 20, canvas: rect(30, 20, '#ffaa00') }] }));
+  const c = await authed();
+  const nodeId = 'save:' + Date.now();
+  const wait = (pred, ms) => new Promise((res) => {
+    const h = (d) => { const m = JSON.parse(d); if (pred(m)) { c.ws.off('message', h); res(m); } };
+    c.ws.on('message', h); setTimeout(() => res(null), ms);
+  });
+  c.ws.send(JSON.stringify({ t: 'import', psd: v1.toString('base64'), name: 'Live.psd' }));
+  const imp = await wait((m) => m.t === 'imported', 3000);
+  c.ws.send(JSON.stringify({ t: 'bind', importId: imp.importId, nodeId, name: 'Live.psd' }));
+  await new Promise((r) => setTimeout(r, 200));
+  // Edit → "open" starts the save-watcher (photoshopApp is a no-op in tests).
+  c.ws.send(JSON.stringify({ t: 'open', nodeId, name: 'Live.psd' }));
+  const opened = await wait((m) => m.t === 'opened', 3000);
+  // simulate Photoshop's save: overwrite the bound file
+  setTimeout(() => fs.writeFileSync(path.join(tmp, 'psd', opened.file), v2), 200);
+  const updated = await wait((m) => m.t === 'updated', 8000);
+  ok('polling watcher detects a save and pushes an update', !!updated);
+  c.ws.close();
 }
 
 bridge.stop();

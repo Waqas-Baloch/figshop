@@ -31,11 +31,17 @@ initializeCanvas(createCanvas, (data, width, height) => {
 // treat every inbound byte as hostile: bind loopback-only, require a pairing
 // token, and bound anything we parse before handing it to a decoder.
 
-const MAX_PAYLOAD = 64 * 1024 * 1024;      // WebSocket frame cap (~48MB of PSD after base64)
-const MAX_PSD_BYTES = 48 * 1024 * 1024;    // reject bigger PSDs before parsing
+const MAX_PAYLOAD = 64 * 1024 * 1024;           // WebSocket frame cap (~48MB of PSD after base64)
+// Two tiers: a PSD UPLOADED over the wire is untrusted → tight. A PSD the user
+// saved LOCALLY in Photoshop is their own file and routinely exceeds 48MB after
+// real editing, so it gets a generous cap (the dimension/pixel guards below are
+// the real decompression-bomb protection).
+const MAX_IMPORT_PSD_BYTES = 48 * 1024 * 1024;
+const MAX_LOCAL_PSD_BYTES = 512 * 1024 * 1024;
 const MAX_PNG_BYTES = 32 * 1024 * 1024;
-const MAX_DIM = 30000;                     // PSD format ceiling
-const MAX_PIXELS = 80e6;                   // guards decompression bombs (80 MP)
+const MAX_DIM = 30000;                          // PSD format ceiling
+const MAX_IMPORT_PIXELS = 80e6;                 // bomb guard for untrusted uploads (80 MP)
+const MAX_LOCAL_PIXELS = 200e6;                 // the user's own saved file can be larger
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 // Bind BOTH loopback addresses: Figma's manifest only allows hostnames (not IP
 // literals), so the plugin must dial "localhost" — which may resolve to ::1 or
@@ -48,19 +54,19 @@ const ALLOWED_ORIGINS = new Set(['null', 'https://www.figma.com', 'https://figma
 
 // Validate a PSD's header *before* parsing it. Reading width/height straight
 // from the 26-byte header lets us reject absurd/hostile files cheaply.
-export function assertSafePsd(buf) {
+export function assertSafePsd(buf, { maxBytes = MAX_IMPORT_PSD_BYTES, maxPixels = MAX_IMPORT_PIXELS } = {}) {
   if (!Buffer.isBuffer(buf) || buf.length < 26) throw new Error('Not a valid PSD file');
   if (buf.toString('ascii', 0, 4) !== '8BPS') throw new Error('Not a PSD file (bad signature)');
-  if (buf.length > MAX_PSD_BYTES) {
-    throw new Error(`PSD too large: ${(buf.length / 1048576) | 0}MB (max ${MAX_PSD_BYTES / 1048576}MB)`);
+  if (buf.length > maxBytes) {
+    throw new Error(`PSD too large: ${(buf.length / 1048576) | 0}MB (max ${maxBytes / 1048576}MB)`);
   }
   const height = buf.readUInt32BE(14);
   const width = buf.readUInt32BE(18);
   if (width < 1 || height < 1 || width > MAX_DIM || height > MAX_DIM) {
     throw new Error(`Refusing PSD with unreasonable dimensions ${width}×${height}`);
   }
-  if (width * height > MAX_PIXELS) {
-    throw new Error(`Refusing PSD with ${((width * height) / 1e6) | 0}MP (max ${MAX_PIXELS / 1e6}MP)`);
+  if (width * height > maxPixels) {
+    throw new Error(`Refusing PSD with ${((width * height) / 1e6) | 0}MP (max ${maxPixels / 1e6}MP)`);
   }
   return { width, height };
 }
@@ -278,24 +284,61 @@ export function createBridge(options = {}) {
     broadcast({ t: 'log', message });
   }
 
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Read + flatten a saved PSD, retrying if we catch Photoshop mid-write (a
+  // truncated read makes the parser throw; on Windows an active save can briefly
+  // lock the file → EBUSY/EPERM). Retrying turns a transient race into a clean
+  // update instead of a spurious "update failed" that leaves the layer stale.
+  async function readSavedPsd(psdPath, attempts = 6) {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const buf = fs.readFileSync(psdPath);
+        assertSafePsd(buf, { maxBytes: MAX_LOCAL_PSD_BYTES, maxPixels: MAX_LOCAL_PIXELS });
+        return compositePreview(buf).png;
+      } catch (e) {
+        lastErr = e;
+        if (/too large|unreasonable|MP \(max/.test(e.message)) throw e; // real rejection, don't retry
+        await delay(300 + i * 250); // mid-save / locked → back off and retry
+      }
+    }
+    throw lastErr;
+  }
+
   function watch(nodeId, psdPath) {
     if (watchers.has(nodeId)) return;
     const w = chokidar.watch(psdPath, {
       ignoreInitial: true,
-      awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
+      // Polling only STATs the file; it never holds the open handle that native
+      // fs.watch keeps — that handle can block Photoshop's save on Windows and
+      // hang the app. Wait longer for the write to settle before we read.
+      usePolling: true,
+      interval: 400,
+      awaitWriteFinish: { stabilityThreshold: 1500, pollInterval: 250 },
     });
-    w.on('change', () => {
+
+    // One flatten at a time per node; coalesce a save that lands mid-flatten.
+    let busy = false;
+    let pending = false;
+    const run = async () => {
+      if (busy) { pending = true; return; }
+      busy = true;
       try {
-        const buf = fs.readFileSync(psdPath);
-        assertSafePsd(buf); // the file on disk could have been swapped
-        const { png } = compositePreview(buf);
+        const png = await readSavedPsd(psdPath);
         broadcast({ t: 'updated', nodeId, png: png.toString('base64') });
         log(`Saved → pushed back to Figma: ${path.basename(psdPath)}`);
       } catch (e) {
         log(`Update failed: ${e.message}`);
         broadcast({ t: 'error', nodeId, message: e.message });
+      } finally {
+        busy = false;
+        if (pending) { pending = false; run(); }
       }
-    });
+    };
+
+    w.on('change', run);
+    w.on('error', (e) => log(`Watcher error: ${e.message}`));
     watchers.set(nodeId, w);
   }
 
