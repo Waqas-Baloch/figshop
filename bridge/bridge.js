@@ -221,6 +221,7 @@ function openInPhotoshop(psdPath, appOverride) {
 export function createBridge(options = {}) {
   const port = Number(options.port || 3900);
   const photoshopApp = options.photoshopApp || null; // null = auto-detect
+  const version = options.version || '0'; // reported to the plugin so it can nudge stale apps
   const dataDir = options.dataDir || path.join(os.homedir(), '.figshop');
   const psdDir = path.join(dataDir, 'psd');
   const indexFile = path.join(dataDir, 'index.json');
@@ -409,7 +410,7 @@ export function createBridge(options = {}) {
       if (!loopbackHost(req)) { res.writeHead(403); res.end('Forbidden'); return; }
       if (req.url === '/health') {
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, platform: process.platform }));
+        res.end(JSON.stringify({ ok: true, platform: process.platform, version }));
         return;
       }
       res.writeHead(200, { 'content-type': 'text/plain' });
@@ -454,7 +455,7 @@ export function createBridge(options = {}) {
             authed = true;
             clearTimeout(authTimer);
             clients.add(ws);
-            ws.send(JSON.stringify({ t: 'ready', platform: process.platform }));
+            ws.send(JSON.stringify({ t: 'ready', platform: process.platform, version }));
             log('Figma plugin paired and connected.');
           } else {
             try { ws.send(JSON.stringify({ t: 'auth-required' })); } catch {}

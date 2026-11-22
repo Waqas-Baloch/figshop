@@ -23,10 +23,20 @@
   .setup p { margin: 0 0 9px; color: #8a6d3b; font-size: 11px; }
   @media (prefers-color-scheme: dark) { .setup { border-color: #5a4a1f; background: #2a230f; } .setup p { color: #d9b96b; } }
   .log { height: 100px; overflow: auto; padding: 8px; border: 1px solid #eee; border-radius: 7px; background: #fafafa; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  .update { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 10px; border: 1px solid #ffd68a; background: #fff6e5; border-radius: 7px; font-size: 11px; color: #8a6d3b; }
+  .update span { flex: 1; }
+  .update button { width: auto; margin: 0; padding: 5px 10px; font-size: 11px; }
+  @media (prefers-color-scheme: dark) { .update { border-color: #5a4a1f; background: #2a230f; color: #d9b96b; } }
   .hidden { display: none; }
 </style>
 
 <div class="status"><span class="dot wait" id="dot"></span><span id="statusText">Looking for the companion app…</span></div>
+
+<!-- shown when connected to an out-of-date companion app -->
+<div class="update hidden" id="update">
+  <span id="updateText">A newer companion app is available.</span>
+  <button id="updateBtn">Update</button>
+</div>
 
 <!-- shown when the companion app isn't running -->
 <div class="setup hidden" id="setup">
@@ -62,6 +72,21 @@
   const BRIDGE = 'ws://localhost:3900';
   const RELEASES_URL = 'https://github.com/Waqas-Baloch/figshop/releases/latest';
   const WAKE_URL = 'figshop://wake';
+  // Minimum companion-app version this plugin expects. Bridges older than this
+  // (or old builds that report no version at all) get an "Update" nudge — they
+  // still work, but may hit bugs that newer apps have fixed.
+  const MIN_APP_VERSION = '0.1.8';
+
+  // a < b, numeric per dotted segment. Missing/garbage version → treat as old.
+  function isOlder(a, b) {
+    const pa = String(a || '0').split('.').map((n) => parseInt(n, 10) || 0);
+    const pb = String(b || '0').split('.').map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const x = pa[i] || 0, y = pb[i] || 0;
+      if (x !== y) return x < y;
+    }
+    return false;
+  }
 
   const isWin = /Win/i.test(navigator.userAgent);
   const $ = (id) => document.getElementById(id);
@@ -98,6 +123,7 @@
     };
     ws.onclose = (e) => {
       connected = false;
+      $('update').classList.add('hidden'); // version is unknown while disconnected
       if (e.code === 4401) { setState('pair'); return; } // don't hammer; wait for a code
       // Once the grace period is up, a failed connect means the app isn't
       // running — show the install panel and keep it shown while we retry.
@@ -109,6 +135,13 @@
       const msg = JSON.parse(ev.data);
       if (msg.t === 'ready') {                 // auth accepted
         connected = true; setState('on'); log('Paired and connected.');
+        // Nudge (don't block) if the companion app is behind this plugin.
+        const stale = isOlder(msg.version, MIN_APP_VERSION);
+        $('updateText').textContent = msg.version
+          ? `Companion app ${msg.version} is out of date — update to ${MIN_APP_VERSION}+ for the latest fixes.`
+          : 'Your companion app is out of date — please update for the latest fixes.';
+        $('update').classList.toggle('hidden', !stale);
+        if (stale) log(`Companion app ${msg.version || '(old)'} is out of date — update recommended.`);
         queue.forEach((m) => ws.send(m)); queue = [];
       }
       else if (msg.t === 'auth-required') { setState('pair'); log('Pairing code needed.'); }
@@ -158,6 +191,7 @@
     log('Pairing…');
   };
   $('download').onclick = () => { toPlugin({ type: 'open-url', url: RELEASES_URL }); log('Opening the installer download…'); };
+  $('updateBtn').onclick = () => { toPlugin({ type: 'open-url', url: RELEASES_URL }); log('Opening the latest companion app…'); };
   $('retry').onclick = () => { log('Retrying…'); attemptWake(); connect(); };
 
   toPlugin({ type: 'ui-ready' }); // main replies with { type:'config', token }

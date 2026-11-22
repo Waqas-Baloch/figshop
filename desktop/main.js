@@ -52,7 +52,7 @@ app.whenReady().then(async () => {
   // Start the bridge FIRST. Nothing may block this — see the login prompt below.
   try {
     const core = await import(pathToFileURL(path.join(__dirname, 'bridge.mjs')).href);
-    bridge = core.createBridge({ port: PORT, photoshopApp: PHOTOSHOP_APP });
+    bridge = core.createBridge({ port: PORT, photoshopApp: PHOTOSHOP_APP, version: app.getVersion() });
     bridge.on('log', fileLog);
     bridge.on('status', (s) => { status = s; updateMenu(); });
     bridge.start();
